@@ -96,6 +96,40 @@ struct StringHash {
 };
 using StringSet = std::unordered_set<string, StringHash, std::equal_to<>>;
 
+struct Buf {
+  char* p = nullptr;
+  size_t len = 0;
+  size_t cap = 0;
+  Buf() = default;
+  Buf(const Buf&) = delete;
+  Buf& operator=(const Buf&) = delete;
+  Buf(Buf&& o) noexcept : p(o.p), len(o.len), cap(o.cap) { o.p = nullptr; o.len = o.cap = 0; }
+  Buf& operator=(Buf&& o) noexcept {
+    if (this != &o) { free(p); p = o.p; len = o.len; cap = o.cap; o.p = nullptr; o.len = o.cap = 0; }
+    return *this;
+  }
+  ~Buf() { free(p); }
+  void reserve(size_t n) {
+    if (n <= cap) return;
+    size_t c = cap == 0 ? 256 : cap;
+    while (c < n) c <<= 1;
+    char* q = (char*)realloc(p, c);
+    if (q == nullptr) throw std::bad_alloc();
+    p = q;
+    cap = c;
+  }
+  void put(char c) { if (len == cap) reserve(cap == 0 ? 256 : cap * 2); p[len++] = c; }
+  void push_back(char c) { put(c); }
+  void append(const char* s, size_t n) { reserve(len + n); if (n) memcpy(p + len, s, n); len += n; }
+  void append(string_view s) { append(s.data(), s.size()); }
+  Buf& operator+=(string_view s) { append(s); return *this; }
+  Buf& operator+=(const char* s) { append(s, strlen(s)); return *this; }
+  Buf& operator+=(const string& s) { append(s.data(), s.size()); return *this; }
+  void clear() { len = 0; }
+  void swap(Buf& o) { char* tp = p; p = o.p; o.p = tp; size_t tl = len; len = o.len; o.len = tl; size_t tc = cap; cap = o.cap; o.cap = tc; }
+  string str() const { return p == nullptr ? string() : string(p, len); }
+};
+
 static inline uint64_t hasZeroByte8(uint64_t v) {
   return (v - 0x0101010101010101ULL) & ~v & 0x8080808080808080ULL;
 }
@@ -193,7 +227,8 @@ static string escapeHtml(string_view s) {
   return out;
 }
 
-static void appendEscapedHtml(string& out, string_view s) {
+template <class O>
+static void appendEscapedHtml(O& out, string_view s) {
   const char* p = s.data();
   size_t n = s.size();
   size_t start = 0;
@@ -206,7 +241,7 @@ static void appendEscapedHtml(string& out, string_view s) {
     unsigned char c = (unsigned char)p[i];
     const char* rep = c == '&' ? "&amp;" : c == '<' ? "&lt;" : c == '>' ? "&gt;" : c == '"' ? "&quot;" : "&#39;";
     out.append(p + start, i - start);
-    out.append(rep);
+    out.append(rep, strlen(rep));
     i++;
     start = i;
   }
@@ -216,7 +251,7 @@ static void appendEscapedHtml(string& out, string_view s) {
     if (c >= 128 || HTML_SPECIAL[c] == 0) continue;
     const char* rep = c == '&' ? "&amp;" : c == '<' ? "&lt;" : c == '>' ? "&gt;" : c == '"' ? "&quot;" : "&#39;";
     out.append(p + start, i - start);
-    out.append(rep);
+    out.append(rep, strlen(rep));
     start = i + 1;
   }
   out.append(p + start, n - start);
@@ -756,7 +791,8 @@ static bool truthy(const Val* v) {
   return false;
 }
 
-static void textOf(string& out, const Val* v) {
+template <class O>
+static void textOf(O& out, const Val* v) {
   if (v == nullptr) return;
   switch (v->t) {
     case Val::NUL: return;
@@ -1927,13 +1963,13 @@ static Val* lookupName(Scope* scope, string_view first) {
 
 class Renderer {
  public:
-  string out;
+  Buf out;
   Scope* constScope = nullptr;
 
   void renderNodes(const vector<TNode*>& nodes, Scope* scope, int depth) {
     for (TNode* n : nodes) {
       switch (n->kind) {
-        case 0: out += n->text; break;
+        case 0: out.append(n->text); break;
         case 1: {
           Val* v = lookup(scope, n->path);
           if (v != nullptr && v->t == Val::STR) appendEscapedHtml(out, v->s);
@@ -1981,13 +2017,13 @@ class Renderer {
           if (n->includeNodes == nullptr || depth >= 8) break;
           if (n->constant && depth + n->includeDepth <= 8) {
             if (!n->constReady) {
-              string saved;
+              Buf saved;
               saved.swap(out);
               renderNodes(*n->includeNodes, constScope, depth + 1);
-              string value;
+              Buf value;
               value.swap(out);
               out.swap(saved);
-              n->constHtml = std::move(value);
+              n->constHtml = value.str();
               n->constReady = true;
             }
             out += n->constHtml;
@@ -1996,13 +2032,13 @@ class Renderer {
             if (key != nullptr) {
               auto it = n->valCache.find(key);
               if (it == n->valCache.end()) {
-                string saved;
+                Buf saved;
                 saved.swap(out);
                 renderNodes(*n->includeNodes, scope, depth + 1);
-                string value;
+                Buf value;
                 value.swap(out);
                 out.swap(saved);
-                it = n->valCache.emplace(key, std::move(value)).first;
+                it = n->valCache.emplace(key, value.str()).first;
               }
               out += it->second;
             } else {
@@ -2449,7 +2485,7 @@ struct Build {
 
     for (size_t i = 0; i < sources.size(); i++) {
       Source& s = sources[i];
-      if (renderBody(s.layoutBody, pages[i], nullptr, nullptr, nullptr)) setOutput(s.outDir + "/index.html", std::move(r.out));
+      if (renderBody(s.layoutBody, pages[i], nullptr, nullptr, nullptr)) setOutput(s.outDir + "/index.html", r.out.str());
     }
 
     int pagesCount = perPage > 0 ? std::max(1, (int)std::ceil((double)posts.size() / perPage)) : 1;
@@ -2466,14 +2502,14 @@ struct Build {
       objPut(pager, "url", valStr(vals, indexUrl(k)));
       objPut(pager, "newer_url", valStr(vals, k == 1 ? string() : indexUrl(k - 1)));
       objPut(pager, "older_url", valStr(vals, k == pagesCount ? string() : indexUrl(k + 1)));
-      if (renderBody(indexBody, nullptr, arr, pager, nullptr)) setOutput(k == 1 ? "index.html" : "page/" + std::to_string(k) + "/index.html", std::move(r.out));
+      if (renderBody(indexBody, nullptr, arr, pager, nullptr)) setOutput(k == 1 ? "index.html" : "page/" + std::to_string(k) + "/index.html", r.out.str());
     }
 
     for (int ti : tagOrder) {
       Tag& t = tags[ti];
-      if (renderBody(tagBody, nullptr, nullptr, nullptr, t.val)) setOutput("tags/" + t.slug + "/index.html", std::move(r.out));
+      if (renderBody(tagBody, nullptr, nullptr, nullptr, t.val)) setOutput("tags/" + t.slug + "/index.html", r.out.str());
     }
-    if (renderBody(tagsBody, nullptr, nullptr, nullptr, nullptr)) setOutput("tags/index.html", std::move(r.out));
+    if (renderBody(tagsBody, nullptr, nullptr, nullptr, nullptr)) setOutput("tags/index.html", r.out.str());
 
     for (const StaticFile& f : statics) {
       if (outIndex.count(string(f.path)) != 0) report.push_back("shadowed " + string(f.path) + ": a built page has its path");
