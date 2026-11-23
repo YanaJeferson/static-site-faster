@@ -4,12 +4,12 @@
 [![rank](https://make.fun/badge/site-generator-speed-01-run-20261122/YanaJeferson/static-site-faster/rank.svg)](https://make.fun/bounty/site-generator-speed-01-run-20261122/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=site-generator-speed-01-run-20261122)
 [![reward](https://make.fun/badge/site-generator-speed-01-run-20261122/YanaJeferson/static-site-faster/reward.svg)](https://make.fun/bounty/site-generator-speed-01-run-20261122?utm_source=github&utm_medium=readme&utm_campaign=site-generator-speed-01-run-20261122)
 
-A dependency-free ES module that reproduces makefun-site 1.0.0's output tree byte for byte, with a single-pass Markdown renderer, bulk HTML escaping and compiled templates.
+A faster drop-in for makefun-site 1.0.0: a Node-API engine (with a pure-JS fallback) that reproduces the reference output tree byte for byte, using single-pass Markdown, compiled templates and bulk escaping.
 
 ## Run it
 
 ```sh
-MAKEFUN_INPUT_DIR=./practice/input MAKEFUN_OUTPUT_DIR=./out node main.ts
+MAKEFUN_INPUT_DIR=/input MAKEFUN_OUTPUT_DIR=/output node main.ts
 ```
 
 ---
