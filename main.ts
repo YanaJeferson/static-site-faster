@@ -10,28 +10,38 @@ const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 const casesPath = `${INPUT_DIR}/cases.json`;
 const outPath = `${OUTPUT_DIR}/answers.json`;
 
-let native: { runFile?: (input: string, output: string) => void; runAll?: (cases: Buffer) => Buffer } | undefined;
+type Engine = { runFile?: (input: string, output: string) => void; runAll?: (cases: Buffer) => Buffer };
+let native: Engine | undefined;
 try {
-  native = createRequire(import.meta.url)('./native/engine.node') as typeof native;
+  const file = process.arch === 'arm64' ? './native/engine.arm64.node' : './native/engine.node';
+  native = createRequire(import.meta.url)(file) as Engine;
 } catch {
   native = undefined;
 }
 
-if (native?.runFile !== undefined) {
-  native.runFile(casesPath, outPath);
-} else {
+async function javascript(): Promise<void> {
   const { readFileSync, writeFileSync } = await import('node:fs');
   if (native?.runAll !== undefined) {
     writeFileSync(outPath, native.runAll(readFileSync(casesPath)));
-  } else {
-    const { setFlagsFromString } = await import('node:v8');
-    setFlagsFromString('--no-incremental-marking');
-    setFlagsFromString('--no-parallel-scavenge');
-    setFlagsFromString('--max-semi-space-size=32');
-    const { run } = (await import(new URL('./solve.js', import.meta.url).href)) as { run: (input: unknown) => unknown };
-    const cases = JSON.parse(readFileSync(casesPath, 'utf8')) as { id: string; input: unknown }[];
-    const answers: unknown[] = [];
-    for (const c of cases) answers.push(run(c.input));
-    writeFileSync(outPath, JSON.stringify(answers));
+    return;
   }
+  const { setFlagsFromString } = await import('node:v8');
+  setFlagsFromString('--no-incremental-marking');
+  setFlagsFromString('--no-parallel-scavenge');
+  setFlagsFromString('--max-semi-space-size=32');
+  const { run } = (await import(new URL('./solve.js', import.meta.url).href)) as { run: (input: unknown) => unknown };
+  const cases = JSON.parse(readFileSync(casesPath, 'utf8')) as { id: string; input: unknown }[];
+  const answers: unknown[] = [];
+  for (const c of cases) answers.push(run(c.input));
+  writeFileSync(outPath, JSON.stringify(answers));
+}
+
+if (native?.runFile !== undefined) {
+  try {
+    native.runFile(casesPath, outPath);
+  } catch {
+    await javascript();
+  }
+} else {
+  await javascript();
 }
