@@ -23,6 +23,11 @@
 #include <algorithm>
 #include <memory>
 #include <deque>
+#ifndef NATIVE_TEST
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#endif
 #if defined(__SSE2__)
 #include <emmintrin.h>
 #endif
@@ -2586,6 +2591,11 @@ struct Build {
         if (v != "site" && v != "tags" && v != "recent") { ok = false; break; }
       }
       templates[i].freeConst = ok;
+      if (getenv("ENGINE_TIMING")) {
+        fprintf(stderr, "  free %s:", templates[i].name.c_str());
+        for (const string& v : templates[i].freeVars) fprintf(stderr, " %s", v.c_str());
+        fprintf(stderr, " const=%d depth=%d\n", (int)ok, templates[i].maxIncludeDepth);
+      }
     }
     for (Template& t : templates) if (t.ok) markConstantIncludes(t.body);
   }
@@ -2701,10 +2711,68 @@ static napi_value RunAll(napi_env env, napi_callback_info info) {
 #endif
 
 #ifndef NATIVE_TEST
+static napi_value RunFile(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2];
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (argc < 2) {
+    napi_throw_type_error(env, nullptr, "runFile needs an input and an output path");
+    return nullptr;
+  }
+  auto pathOf = [&](napi_value v, string& out) {
+    size_t len = 0;
+    napi_get_value_string_utf8(env, v, nullptr, 0, &len);
+    out.resize(len + 1);
+    napi_get_value_string_utf8(env, v, out.data(), len + 1, &len);
+    out.resize(len);
+  };
+  string inPath, outPath;
+  pathOf(argv[0], inPath);
+  pathOf(argv[1], outPath);
+  try {
+    int fd = open(inPath.c_str(), O_RDONLY);
+    if (fd < 0) throw std::runtime_error("cannot open " + inPath);
+    struct stat st;
+    if (fstat(fd, &st) != 0) { close(fd); throw std::runtime_error("cannot stat " + inPath); }
+    size_t size = (size_t)st.st_size;
+    string input;
+    input.resize(size);
+    size_t got = 0;
+    while (got < size) {
+      ssize_t n = read(fd, input.data() + got, size - got);
+      if (n <= 0) { close(fd); throw std::runtime_error("cannot read " + inPath); }
+      got += (size_t)n;
+    }
+    close(fd);
+
+    OutBuf result = runAll(input);
+
+    int out = open(outPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (out < 0) throw std::runtime_error("cannot open " + outPath);
+    size_t wrote = 0;
+    while (wrote < result.len) {
+      ssize_t n = write(out, result.data + wrote, result.len - wrote);
+      if (n <= 0) { close(out); throw std::runtime_error("cannot write " + outPath); }
+      wrote += (size_t)n;
+    }
+    close(out);
+  } catch (const std::exception& e) {
+    napi_throw_error(env, nullptr, e.what());
+    return nullptr;
+  }
+  return nullptr;
+}
+
+#endif
+
+#ifndef NATIVE_TEST
 NAPI_MODULE_INIT() {
   napi_value fn;
   napi_create_function(env, "runAll", NAPI_AUTO_LENGTH, RunAll, nullptr, &fn);
   napi_set_named_property(env, exports, "runAll", fn);
+  napi_value fn2;
+  napi_create_function(env, "runFile", NAPI_AUTO_LENGTH, RunFile, nullptr, &fn2);
+  napi_set_named_property(env, exports, "runFile", fn2);
   return exports;
 }
 #endif

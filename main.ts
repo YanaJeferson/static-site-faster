@@ -1,6 +1,6 @@
-// The harness' driver (node22): reads every case from /input/cases.json, answers each one
-// alone, and writes /output/answers.json in the cases' order. The native engine (native/engine.node)
-// does the whole build and the JSON in C++; if it cannot load, solve.js answers the same tree.
+// The harness' driver (node22): the native engine (native/engine.node) reads /input/cases.json,
+// builds every case and writes /output/answers.json in C++. If the addon cannot load, solve.js
+// answers the same tree in JavaScript.
 // MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand in for /input and /output outside a container.
 
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -19,14 +19,16 @@ const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 const casesPath = join(INPUT_DIR, 'cases.json');
 const outPath = join(OUTPUT_DIR, 'answers.json');
 
-let native: { runAll: (cases: Buffer) => Buffer } | undefined;
+let native: { runFile?: (input: string, output: string) => void; runAll?: (cases: Buffer) => Buffer } | undefined;
 try {
-  native = createRequire(import.meta.url)('./native/engine.node') as { runAll: (cases: Buffer) => Buffer };
+  native = createRequire(import.meta.url)('./native/engine.node') as typeof native;
 } catch {
   native = undefined;
 }
 
-if (native !== undefined) {
+if (native?.runFile !== undefined) {
+  native.runFile(casesPath, outPath);
+} else if (native?.runAll !== undefined) {
   writeFileSync(outPath, native.runAll(readFileSync(casesPath)));
 } else {
   const { run } = (await import(new URL('./solve.js', import.meta.url).href)) as { run: (input: unknown) => unknown };
