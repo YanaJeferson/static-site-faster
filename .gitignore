@@ -1,3 +1,6 @@
 node_modules/
 out/
 *.log
+
+native/inline-test*
+native/engine_dbg.node
