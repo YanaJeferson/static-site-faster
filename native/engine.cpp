@@ -78,6 +78,12 @@ static inline int htmlMask16(const char* p) {
   m = _mm_or_si128(m, _mm_cmpeq_epi8(v, splat('\'')));
   return _mm_movemask_epi8(m);
 }
+static inline int strMask16(const char* p) {
+  __m128i v = _mm_loadu_si128((const __m128i*)p);
+  __m128i m = _mm_cmpeq_epi8(v, splat('"'));
+  m = _mm_or_si128(m, _mm_cmpeq_epi8(v, splat('\\')));
+  return _mm_movemask_epi8(m);
+}
 static inline int jsonMask16(const char* p) {
   __m128i v = _mm_loadu_si128((const __m128i*)p);
   __m128i m = _mm_cmpeq_epi8(v, splat('"'));
@@ -425,6 +431,14 @@ class CasesParser {
     size_t outStart = pool.size();
     while (i < p.size()) {
       size_t start = i;
+#if defined(__SSE2__)
+      while (i + 16 <= p.size()) {
+        int mask = strMask16(p.data() + i);
+        if (mask == 0) { i += 16; continue; }
+        i += (size_t)__builtin_ctz((unsigned)mask);
+        break;
+      }
+#endif
       while (i < p.size() && p[i] != '"' && p[i] != '\\') i++;
       if (i > start) pool.append(p.substr(start, i - start));
       if (i >= p.size()) fail("unterminated string");
@@ -1664,8 +1678,8 @@ static string inlineRender(string_view s, LinkEnv& env) {
   return out;
 }
 
-static MarkdownResult renderMarkdown(string_view src, LinkEnv& env) {
-  vector<string_view> lines;
+static MarkdownResult renderMarkdown(string_view src, LinkEnv& env, vector<string_view>& lines) {
+  lines.clear();
   size_t start = 0;
   while (true) {
     size_t nl = src.find('\n', start);
@@ -1679,6 +1693,8 @@ static MarkdownResult renderMarkdown(string_view src, LinkEnv& env) {
   MarkdownResult res;
   res.html.reserve(src.size() * 2 + 256);
   bool firstBlock = true;
+  string scratch;
+  string itemScratch;
   auto beginBlock = [&]() {
     if (!firstBlock) res.html.push_back('\n');
     firstBlock = false;
@@ -1688,7 +1704,9 @@ static MarkdownResult renderMarkdown(string_view src, LinkEnv& env) {
   while (i < lines.size()) {
     string_view line = lines[i];
     if (isBlankLine(line)) { i++; continue; }
-    FenceInfo fence = fenceOpen(line);
+    char first = line[0];
+    FenceInfo fence;
+    if (first == '`') fence = fenceOpen(line);
     if (fence.open) {
       i++;
       beginBlock();
@@ -1708,7 +1726,8 @@ static MarkdownResult renderMarkdown(string_view src, LinkEnv& env) {
       res.html += "</code></pre>";
       continue;
     }
-    HeadingInfo h = headingOf(line);
+    HeadingInfo h;
+    if (first == '#') h = headingOf(line);
     if (h.ok) {
       string slug = slugify(h.text);
       string id = uniqueSlugSmall(slug, ids);
@@ -1729,17 +1748,17 @@ static MarkdownResult renderMarkdown(string_view src, LinkEnv& env) {
       i++;
       continue;
     }
-    if (isHr(line)) { beginBlock(); res.html += "<hr>"; i++; continue; }
-    if (line[0] == '>') {
-      string body;
+    if ((first == '-' || first == '*') && isHr(line)) { beginBlock(); res.html += "<hr>"; i++; continue; }
+    if (first == '>') {
+      scratch.clear();
       bool first = true;
       while (i < lines.size() && !lines[i].empty() && lines[i][0] == '>') {
         string_view l = lines[i++];
         size_t off = (l.size() > 1 && l[1] == ' ') ? 2 : 1;
         string_view text = trimLine(l.substr(off));
         if (!text.empty()) {
-          if (!first) body.push_back('\n');
-          body.append(text);
+          if (!first) scratch.push_back('\n');
+          scratch.append(text);
           first = false;
         }
       }
@@ -1747,14 +1766,14 @@ static MarkdownResult renderMarkdown(string_view src, LinkEnv& env) {
       if (first) res.html += "<blockquote>\n</blockquote>";
       else {
         res.html += "<blockquote>\n<p>";
-        inlineInto(res.html, body, env);
+        inlineInto(res.html, scratch, env);
         res.html += "</p>\n</blockquote>";
       }
       continue;
     }
     string_view bulletText;
-    bool isBullet = bulletOf(line, bulletText);
-    OrderedInfo ordered = isBullet ? OrderedInfo() : orderedOf(line);
+    bool isBullet = (first == '-' || first == '*') ? bulletOf(line, bulletText) : false;
+    OrderedInfo ordered = (first >= '0' && first <= '9') ? orderedOf(line) : OrderedInfo();
     if (isBullet || ordered.ok) {
       bool isOrdered = ordered.ok;
       beginBlock();
@@ -1763,13 +1782,13 @@ static MarkdownResult renderMarkdown(string_view src, LinkEnv& env) {
         res.html += std::to_string(ordered.start);
         res.html += "\">\n";
       } else res.html += isOrdered ? "<ol>\n" : "<ul>\n";
-      string item;
+      itemScratch.clear();
       bool openItem = false;
       auto closeItem = [&]() {
         res.html += "<li>";
-        inlineInto(res.html, item, env);
+        inlineInto(res.html, itemScratch, env);
         res.html += "</li>\n";
-        item.clear();
+        itemScratch.clear();
       };
       while (i < lines.size()) {
         bool isItem = false;
@@ -1783,14 +1802,14 @@ static MarkdownResult renderMarkdown(string_view src, LinkEnv& env) {
         }
         if (isItem) {
           if (openItem) closeItem();
-          item.assign(trimLine(text));
+          itemScratch.assign(trimLine(text));
           openItem = true;
           i++;
           continue;
         }
         if (openItem && isContinued(lines[i])) {
-          item.push_back('\n');
-          item.append(trimLine(lines[i]));
+          itemScratch.push_back('\n');
+          itemScratch.append(trimLine(lines[i]));
           i++;
           continue;
         }
@@ -1800,17 +1819,17 @@ static MarkdownResult renderMarkdown(string_view src, LinkEnv& env) {
       res.html += isOrdered ? "</ol>" : "</ul>";
       continue;
     }
-    string body(trimLine(line));
+    scratch.assign(trimLine(line));
     i++;
     while (i < lines.size() && !endsParagraph(lines[i])) {
-      body.push_back('\n');
-      body.append(trimLine(lines[i]));
+      scratch.push_back('\n');
+      scratch.append(trimLine(lines[i]));
       i++;
     }
     beginBlock();
     if (!res.hasExcerpt) {
       string html;
-      inlineInto(html, body, env);
+      inlineInto(html, scratch, env);
       res.excerpt = html;
       res.hasExcerpt = true;
       res.html += "<p>";
@@ -1818,7 +1837,7 @@ static MarkdownResult renderMarkdown(string_view src, LinkEnv& env) {
       res.html += "</p>";
     } else {
       res.html += "<p>";
-      inlineInto(res.html, body, env);
+      inlineInto(res.html, scratch, env);
       res.html += "</p>";
     }
   }
@@ -2206,6 +2225,7 @@ struct Build {
   void markdownPass() {
     for (auto& f : statics) staticPaths.emplace(f.path);
     LinkEnv env;
+    vector<string_view> lineScratch;
     env.base = &base;
     env.bySource = &bySource;
     env.statics = &staticPaths;
@@ -2222,7 +2242,7 @@ struct Build {
       auto it = linkCache.find(curDir);
       if (it == linkCache.end()) it = linkCache.emplace(curDir, unordered_map<string_view, string>()).first;
       env.currentCache = &it->second;
-      MarkdownResult md = renderMarkdown(s.body, env);
+      MarkdownResult md = renderMarkdown(s.body, env, lineScratch);
       s.html = std::move(md.html);
       s.toc = std::move(md.toc);
       s.excerpt = std::move(md.excerpt);
