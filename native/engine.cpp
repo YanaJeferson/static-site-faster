@@ -23,6 +23,9 @@
 #include <algorithm>
 #include <memory>
 #include <deque>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 #include <stdexcept>
 #include <chrono>
 
@@ -45,6 +48,41 @@ struct SpecialTables {
     for (char c : string_view("&<>\"'")) HTML_SPECIAL[(unsigned char)c] = 1;
   }
 } specialTablesInit;
+
+#if defined(__SSE2__)
+static inline __m128i splat(char c) { return _mm_set1_epi8(c); }
+static inline int mdMask16(const char* p) {
+  __m128i v = _mm_loadu_si128((const __m128i*)p);
+  __m128i m = _mm_cmpeq_epi8(v, splat('&'));
+  m = _mm_or_si128(m, _mm_cmpeq_epi8(v, splat('<')));
+  m = _mm_or_si128(m, _mm_cmpeq_epi8(v, splat('>')));
+  m = _mm_or_si128(m, _mm_cmpeq_epi8(v, splat('"')));
+  m = _mm_or_si128(m, _mm_cmpeq_epi8(v, splat('\'')));
+  m = _mm_or_si128(m, _mm_cmpeq_epi8(v, splat('\\')));
+  m = _mm_or_si128(m, _mm_cmpeq_epi8(v, splat('`')));
+  m = _mm_or_si128(m, _mm_cmpeq_epi8(v, splat('*')));
+  m = _mm_or_si128(m, _mm_cmpeq_epi8(v, splat('[')));
+  return _mm_movemask_epi8(m);
+}
+static inline int htmlMask16(const char* p) {
+  __m128i v = _mm_loadu_si128((const __m128i*)p);
+  __m128i m = _mm_cmpeq_epi8(v, splat('&'));
+  m = _mm_or_si128(m, _mm_cmpeq_epi8(v, splat('<')));
+  m = _mm_or_si128(m, _mm_cmpeq_epi8(v, splat('>')));
+  m = _mm_or_si128(m, _mm_cmpeq_epi8(v, splat('"')));
+  m = _mm_or_si128(m, _mm_cmpeq_epi8(v, splat('\'')));
+  return _mm_movemask_epi8(m);
+}
+static inline int jsonMask16(const char* p) {
+  __m128i v = _mm_loadu_si128((const __m128i*)p);
+  __m128i m = _mm_cmpeq_epi8(v, splat('"'));
+  m = _mm_or_si128(m, _mm_cmpeq_epi8(v, splat('\\')));
+  __m128i ctl = _mm_cmpeq_epi8(_mm_subs_epu8(v, splat(0x1F)), _mm_setzero_si128());
+  m = _mm_or_si128(m, ctl);
+  return _mm_movemask_epi8(m);
+}
+#endif
+
 
 struct StringHash {
   using is_transparent = void;
@@ -151,16 +189,32 @@ static string escapeHtml(string_view s) {
 }
 
 static void appendEscapedHtml(string& out, string_view s) {
+  const char* p = s.data();
+  size_t n = s.size();
   size_t start = 0;
-  for (size_t i = 0; i < s.size(); i++) {
-    unsigned char c = (unsigned char)s[i];
+  size_t i = 0;
+#if defined(__SSE2__)
+  while (i + 16 <= n) {
+    int mask = htmlMask16(p + i);
+    if (mask == 0) { i += 16; continue; }
+    i += (size_t)__builtin_ctz((unsigned)mask);
+    unsigned char c = (unsigned char)p[i];
+    const char* rep = c == '&' ? "&amp;" : c == '<' ? "&lt;" : c == '>' ? "&gt;" : c == '"' ? "&quot;" : "&#39;";
+    out.append(p + start, i - start);
+    out.append(rep);
+    i++;
+    start = i;
+  }
+#endif
+  for (; i < n; i++) {
+    unsigned char c = (unsigned char)p[i];
     if (c >= 128 || HTML_SPECIAL[c] == 0) continue;
     const char* rep = c == '&' ? "&amp;" : c == '<' ? "&lt;" : c == '>' ? "&gt;" : c == '"' ? "&quot;" : "&#39;";
-    out.append(s.substr(start, i - start));
+    out.append(p + start, i - start);
     out.append(rep);
     start = i + 1;
   }
-  out.append(s.substr(start));
+  out.append(p + start, n - start);
 }
 
 static const char* kMonths[] = {"January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"};
@@ -285,47 +339,24 @@ static int countWords(string_view s) {
 
 // ------------------------------------------------------------------ JSON input
 
-struct JVal;
-using JPair = std::pair<string_view, JVal*>;
-
-struct JVal {
-  enum Type : uint8_t { NUL, BOOL, NUM, STR, ARR, OBJ } t = NUL;
-  bool b = false;
-  double n = 0;
-  string_view s;
-  vector<JVal*> arr;
-  vector<JPair> obj;
-
-  const JVal* get(string_view key) const {
-    for (const auto& kv : obj) if (kv.first == key) return kv.second;
-    return nullptr;
-  }
+struct CaseInput {
+  string_view siteTitle;
+  string_view baseUrl;
+  int perPage = 0;
+  int recent = 0;
+  vector<std::pair<string_view, string_view>> templates;
+  vector<std::pair<string_view, string_view>> files;
 };
 
-class JNodePool {
+class CasesParser {
  public:
-  string decode;
-  JVal* make() {
-    nodes.emplace_back();
-    return &nodes.back();
-  }
- private:
-  std::deque<JVal> nodes;
-};
+  explicit CasesParser(string_view text) : p(text) { pool.reserve(text.size() + 16); }
+  vector<CaseInput> parse();
+  string pool;
 
-class JsonParser {
- public:
-  JsonParser(string_view text, JNodePool& pool) : p(text), pool(pool) {}
-  JVal* parse() {
-    JVal* v = value();
-    ws();
-    if (i != p.size()) fail("trailing input");
-    return v;
-  }
  private:
   string_view p;
   size_t i = 0;
-  JNodePool& pool;
 
   [[noreturn]] void fail(const char* what) {
     throw std::runtime_error(string("json: ") + what + " at " + std::to_string(i));
@@ -341,215 +372,209 @@ class JsonParser {
     if (i < p.size() && p[i] == c) { i++; return true; }
     return false;
   }
-  JVal* value() {
-    ws();
-    if (i >= p.size()) fail("eof");
-    char c = p[i];
-    JVal* v = pool.make();
-    if (c == '{') {
-      i++;
-      v->t = JVal::OBJ;
-      ws();
-      if (eat('}')) return v;
-      while (true) {
-        ws();
-        if (i >= p.size() || p[i] != '"') fail("object key");
-        string_view key = parseString();
-        ws();
-        if (!eat(':')) fail("colon");
-        JVal* child = value();
-        v->obj.emplace_back(std::move(key), child);
-        ws();
-        if (eat(',')) continue;
-        if (eat('}')) break;
-        fail("object");
-      }
-      return v;
-    }
-    if (c == '[') {
-      i++;
-      v->t = JVal::ARR;
-      ws();
-      if (eat(']')) return v;
-      while (true) {
-        v->arr.push_back(value());
-        ws();
-        if (eat(',')) continue;
-        if (eat(']')) break;
-        fail("array");
-      }
-      return v;
-    }
-    if (c == '"') {
-      v->t = JVal::STR;
-      v->s = parseString();
-      return v;
-    }
-    if (c == 't' && p.substr(i, 4) == "true") { i += 4; v->t = JVal::BOOL; v->b = true; return v; }
-    if (c == 'f' && p.substr(i, 5) == "false") { i += 5; v->t = JVal::BOOL; v->b = false; return v; }
-    if (c == 'n' && p.substr(i, 4) == "null") { i += 4; v->t = JVal::NUL; return v; }
-    if (c == '-' || (c >= '0' && c <= '9')) {
-      size_t start = i;
-      if (p[i] == '-') i++;
-      while (i < p.size() && p[i] >= '0' && p[i] <= '9') i++;
-      if (i < p.size() && p[i] == '.') {
-        i++;
-        while (i < p.size() && p[i] >= '0' && p[i] <= '9') i++;
-      }
-      if (i < p.size() && (p[i] == 'e' || p[i] == 'E')) {
-        i++;
-        if (i < p.size() && (p[i] == '+' || p[i] == '-')) i++;
-        while (i < p.size() && p[i] >= '0' && p[i] <= '9') i++;
-      }
-      string num(p.substr(start, i - start));
-      v->t = JVal::NUM;
-      v->n = std::strtod(num.c_str(), nullptr);
-      return v;
-    }
-    fail("value");
-  }
+  void expect(char c) { if (!eat(c)) fail("expected character"); }
   static int hex(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
     if (c >= 'A' && c <= 'F') return c - 'A' + 10;
     return -1;
   }
-  string_view parseString() {
-    if (p[i] != '"') fail("string");
+  string_view str() {
+    if (i >= p.size() || p[i] != '"') fail("string");
     i++;
-    size_t begin = i;
-    bool escaped = false;
-    size_t j = i;
-    while (j < p.size()) {
-      char c = p[j];
-      if (c == '\\') { escaped = true; j += 2; continue; }
-      if (c == '"') break;
-      j++;
-    }
-    if (j >= p.size()) fail("unterminated string");
-    string_view raw = p.substr(begin, j - begin);
-    i = j + 1;
-    if (!escaped) return raw;
-
-    string& out = pool.decode;
-    size_t outStart = out.size();
-    size_t k = 0;
-    while (k < raw.size()) {
-      size_t e = raw.find('\\', k);
-      if (e == string_view::npos) {
-        out.append(raw.substr(k));
-        break;
-      }
-      if (e > k) out.append(raw.substr(k, e - k));
-      size_t q = e + 1;
-      if (q >= raw.size()) fail("escape");
-      char c = raw[q++];
-      switch (c) {
-        case '"': out.push_back('"'); break;
-        case '\\': out.push_back('\\'); break;
-        case '/': out.push_back('/'); break;
-        case 'b': out.push_back('\b'); break;
-        case 'f': out.push_back('\f'); break;
-        case 'n': out.push_back('\n'); break;
-        case 'r': out.push_back('\r'); break;
-        case 't': out.push_back('\t'); break;
+    size_t outStart = pool.size();
+    while (i < p.size()) {
+      size_t start = i;
+      while (i < p.size() && p[i] != '"' && p[i] != '\\') i++;
+      if (i > start) pool.append(p.substr(start, i - start));
+      if (i >= p.size()) fail("unterminated string");
+      char c = p[i];
+      if (c == '"') { i++; return string_view(pool.data() + outStart, pool.size() - outStart); }
+      i++;
+      if (i >= p.size()) fail("escape");
+      char e = p[i++];
+      switch (e) {
+        case '"': pool.push_back('"'); break;
+        case '\\': pool.push_back('\\'); break;
+        case '/': pool.push_back('/'); break;
+        case 'b': pool.push_back('\b'); break;
+        case 'f': pool.push_back('\f'); break;
+        case 'n': pool.push_back('\n'); break;
+        case 'r': pool.push_back('\r'); break;
+        case 't': pool.push_back('\t'); break;
         case 'u': {
-          if (q + 4 > raw.size()) fail("unicode escape");
+          if (i + 4 > p.size()) fail("unicode escape");
           uint32_t cp = 0;
-          for (int h = 0; h < 4; h++) {
-            int v = hex(raw[q + h]);
-            if (v < 0) fail("unicode escape");
-            cp = cp * 16 + v;
+          for (int k = 0; k < 4; k++) {
+            int h = hex(p[i + k]);
+            if (h < 0) fail("unicode escape");
+            cp = cp * 16 + h;
           }
-          q += 4;
-          if (cp >= 0xD800 && cp <= 0xDBFF && q + 6 <= raw.size() && raw[q] == '\\' && raw[q + 1] == 'u') {
+          i += 4;
+          if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 <= p.size() && p[i] == '\\' && p[i + 1] == 'u') {
             uint32_t lo = 0;
             bool ok = true;
-            for (int h = 0; h < 4; h++) {
-              int v = hex(raw[q + 2 + h]);
-              if (v < 0) { ok = false; break; }
-              lo = lo * 16 + v;
+            for (int k = 0; k < 4; k++) {
+              int h = hex(p[i + 2 + k]);
+              if (h < 0) { ok = false; break; }
+              lo = lo * 16 + h;
             }
             if (ok && lo >= 0xDC00 && lo <= 0xDFFF) {
               cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-              q += 6;
+              i += 6;
             }
           }
-          if (cp == 0) out.push_back('\0');
-          else utf8Append(out, cp);
+          if (cp == 0) pool.push_back('\0');
+          else utf8Append(pool, cp);
           break;
         }
         default: fail("escape");
       }
-      k = q;
-    }
-    return string_view(out.data() + outStart, out.size() - outStart);
-  }
-
-  /*
-  string parseStringOld() {
-    if (p[i] != '"') fail("string");
-    i++;
-    string out;
-    size_t start = i;
-    while (i < p.size()) {
-      char c = p[i];
-      if (c == '"') {
-        out.append(p.substr(start, i - start));
-        i++;
-        return out;
-      }
-      if (c == '\\') {
-        out.append(p.substr(start, i - start));
-        i++;
-        if (i >= p.size()) fail("escape");
-        char e = p[i++];
-        switch (e) {
-          case '"': out.push_back('"'); break;
-          case '\\': out.push_back('\\'); break;
-          case '/': out.push_back('/'); break;
-          case 'b': out.push_back('\b'); break;
-          case 'f': out.push_back('\f'); break;
-          case 'n': out.push_back('\n'); break;
-          case 'r': out.push_back('\r'); break;
-          case 't': out.push_back('\t'); break;
-          case 'u': {
-            if (i + 4 > p.size()) fail("unicode escape");
-            uint32_t cp = 0;
-            for (int k = 0; k < 4; k++) {
-              int h = hex(p[i + k]);
-              if (h < 0) fail("unicode escape");
-              cp = cp * 16 + h;
-            }
-            i += 4;
-            if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 <= p.size() && p[i] == '\\' && p[i + 1] == 'u') {
-              uint32_t lo = 0;
-              bool ok = true;
-              for (int k = 0; k < 4; k++) {
-                int h = hex(p[i + 2 + k]);
-                if (h < 0) { ok = false; break; }
-                lo = lo * 16 + h;
-              }
-              if (ok && lo >= 0xDC00 && lo <= 0xDFFF) {
-                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                i += 6;
-              }
-            }
-            if (cp == 0) out.push_back('\0');
-            else utf8Append(out, cp);
-            break;
-          }
-          default: fail("escape");
-        }
-        start = i;
-      } else {
-        i++;
-      }
     }
     fail("unterminated string");
   }
-  */
+
+  double num() {
+    size_t start = i;
+    if (i < p.size() && p[i] == '-') i++;
+    while (i < p.size() && p[i] >= '0' && p[i] <= '9') i++;
+    if (i < p.size() && p[i] == '.') { i++; while (i < p.size() && p[i] >= '0' && p[i] <= '9') i++; }
+    if (i < p.size() && (p[i] == 'e' || p[i] == 'E')) {
+      i++;
+      if (i < p.size() && (p[i] == '+' || p[i] == '-')) i++;
+      while (i < p.size() && p[i] >= '0' && p[i] <= '9') i++;
+    }
+    if (i == start) fail("number");
+    string tmp(p.substr(start, i - start));
+    return std::strtod(tmp.c_str(), nullptr);
+  }
+  void skipValue() {
+    ws();
+    if (i >= p.size()) fail("value");
+    char c = p[i];
+    if (c == '"') { str(); return; }
+    if (c == '{') {
+      i++; ws();
+      if (eat('}')) return;
+      while (true) {
+        ws(); str(); ws(); expect(':'); skipValue(); ws();
+        if (eat(',')) continue;
+        expect('}');
+        return;
+      }
+    }
+    if (c == '[') {
+      i++; ws();
+      if (eat(']')) return;
+      while (true) {
+        skipValue(); ws();
+        if (eat(',')) continue;
+        expect(']');
+        return;
+      }
+    }
+    if (p.substr(i, 4) == "true") { i += 4; return; }
+    if (p.substr(i, 5) == "false") { i += 5; return; }
+    if (p.substr(i, 4) == "null") { i += 4; return; }
+    num();
+  }
+  void parseSite(CaseInput& c) {
+    ws(); expect('{'); ws();
+    if (eat('}')) return;
+    while (true) {
+      ws(); string_view k = str(); ws(); expect(':');
+      if (k == "title") { ws(); c.siteTitle = str(); }
+      else if (k == "base_url") { ws(); c.baseUrl = str(); }
+      else if (k == "per_page") { ws(); c.perPage = (int)num(); }
+      else if (k == "recent") { ws(); c.recent = (int)num(); }
+      else skipValue();
+      ws();
+      if (eat(',')) continue;
+      expect('}');
+      return;
+    }
+  }
+  void parseTemplates(CaseInput& c) {
+    ws(); expect('{'); ws();
+    if (eat('}')) return;
+    while (true) {
+      ws(); string_view k = str(); ws(); expect(':');
+      ws(); string_view v = str(); c.templates.emplace_back(k, v);
+      ws();
+      if (eat(',')) continue;
+      expect('}');
+      return;
+    }
+  }
+  void parseFiles(CaseInput& c) {
+    ws(); expect('['); ws();
+    if (eat(']')) return;
+    while (true) {
+      ws(); expect('{'); ws();
+      string_view path, content;
+      if (!eat('}')) {
+        while (true) {
+          ws(); string_view k = str(); ws(); expect(':');
+          if (k == "path") { ws(); path = str(); }
+          else if (k == "content") { ws(); content = str(); }
+          else skipValue();
+          ws();
+          if (eat(',')) continue;
+          expect('}');
+          break;
+        }
+      }
+      c.files.emplace_back(path, content);
+      ws();
+      if (eat(',')) continue;
+      expect(']');
+      return;
+    }
+  }
+  void parseInput(CaseInput& c) {
+    ws(); expect('{'); ws();
+    if (eat('}')) return;
+    while (true) {
+      ws(); string_view k = str(); ws(); expect(':');
+      if (k == "site") parseSite(c);
+      else if (k == "templates") parseTemplates(c);
+      else if (k == "files") parseFiles(c);
+      else skipValue();
+      ws();
+      if (eat(',')) continue;
+      expect('}');
+      return;
+    }
+  }
 };
+
+vector<CaseInput> CasesParser::parse() {
+  vector<CaseInput> cases;
+  ws(); expect('['); ws();
+  if (eat(']')) return cases;
+  while (true) {
+    ws(); expect('{'); ws();
+    CaseInput c;
+    bool hasInput = false;
+    if (!eat('}')) {
+      while (true) {
+        ws(); string_view k = str(); ws(); expect(':');
+        if (k == "input") { parseInput(c); hasInput = true; }
+        else skipValue();
+        ws();
+        if (eat(',')) continue;
+        expect('}');
+        break;
+      }
+    }
+    if (!hasInput) fail("case without input");
+    cases.push_back(std::move(c));
+    ws();
+    if (eat(',')) continue;
+    expect(']');
+    return cases;
+  }
+}
 
 // ------------------------------------------------------------------ output JSON
 
@@ -601,61 +626,59 @@ static inline uint64_t hasLessThan32(uint64_t v) {
 }
 
 static void jsonStringTo(OutBuf& out, string_view s) {
-  out.put('"');
-  const char* p = s.data();
   size_t n = s.size();
+  out.ensure(n * 6 + 2);
+  char* base = out.data;
+  size_t w = out.len;
+  base[w++] = '"';
+  const char* p = s.data();
   size_t start = 0;
   size_t i = 0;
-  while (i + 8 <= n) {
-    uint64_t v;
-    memcpy(&v, p + i, 8);
-    uint64_t mask = hasZeroByte(v ^ 0x2222222222222222ULL) | hasZeroByte(v ^ 0x5C5C5C5C5C5C5C5CULL) | hasLessThan32(v);
-    if (mask == 0) { i += 8; continue; }
-    i += (size_t)(__builtin_ctzll(mask) >> 3);
-    unsigned char c = (unsigned char)p[i];
-    out.write(p + start, i - start);
-    switch (c) {
-      case '"': out.write("\\\"", 2); break;
-      case '\\': out.write("\\\\", 2); break;
-      case '\b': out.write("\\b", 2); break;
-      case '\f': out.write("\\f", 2); break;
-      case '\n': out.write("\\n", 2); break;
-      case '\r': out.write("\\r", 2); break;
-      case '\t': out.write("\\t", 2); break;
-      default: {
-        static const char* hex = "0123456789abcdef";
-        char buf[6] = {'\\', 'u', '0', '0', hex[(c >> 4) & 15], hex[c & 15]};
-        out.write(buf, 6);
-        break;
-      }
-    }
-    i++;
-    start = i;
-  }
   while (i < n) {
+#if defined(__SSE2__)
+    while (i + 16 <= n) {
+      int mask = jsonMask16(p + i);
+      if (mask == 0) { i += 16; continue; }
+      i += (size_t)__builtin_ctz((unsigned)mask);
+      break;
+    }
+#endif
+    while (i < n) {
+      unsigned char c = (unsigned char)p[i];
+      if (c < 0x20 || c == '"' || c == '\\') break;
+      i++;
+    }
+    if (i > start) {
+      memcpy(base + w, p + start, i - start);
+      w += i - start;
+      start = i;
+    }
+    if (i >= n) break;
     unsigned char c = (unsigned char)p[i];
-    if (c >= 0x20 && c != '"' && c != '\\') { i++; continue; }
-    out.write(p + start, i - start);
     switch (c) {
-      case '"': out.write("\\\"", 2); break;
-      case '\\': out.write("\\\\", 2); break;
-      case '\b': out.write("\\b", 2); break;
-      case '\f': out.write("\\f", 2); break;
-      case '\n': out.write("\\n", 2); break;
-      case '\r': out.write("\\r", 2); break;
-      case '\t': out.write("\\t", 2); break;
+      case '"': base[w++] = '\\'; base[w++] = '"'; break;
+      case '\\': base[w++] = '\\'; base[w++] = '\\'; break;
+      case '\b': base[w++] = '\\'; base[w++] = 'b'; break;
+      case '\f': base[w++] = '\\'; base[w++] = 'f'; break;
+      case '\n': base[w++] = '\\'; base[w++] = 'n'; break;
+      case '\r': base[w++] = '\\'; base[w++] = 'r'; break;
+      case '\t': base[w++] = '\\'; base[w++] = 't'; break;
       default: {
         static const char* hex = "0123456789abcdef";
-        char buf[6] = {'\\', 'u', '0', '0', hex[(c >> 4) & 15], hex[c & 15]};
-        out.write(buf, 6);
+        base[w++] = '\\'; base[w++] = 'u'; base[w++] = '0'; base[w++] = '0';
+        base[w++] = hex[(c >> 4) & 15]; base[w++] = hex[c & 15];
         break;
       }
     }
     i++;
     start = i;
   }
-  out.write(p + start, n - start);
-  out.put('"');
+  if (start < n) {
+    memcpy(base + w, p + start, n - start);
+    w += n - start;
+  }
+  base[w++] = '"';
+  out.len = w;
 }
 
 // ------------------------------------------------------------------ template values
@@ -1496,12 +1519,22 @@ static void inlineInto(string& out, string_view s, LinkEnv& env) {
   size_t i = 0;
   while (i < s.size()) {
     size_t start = i;
-    while (i < s.size()) {
-      unsigned char c = (unsigned char)s[i];
+    const char* p = s.data();
+    size_t n = s.size();
+#if defined(__SSE2__)
+    while (i + 16 <= n) {
+      int mask = mdMask16(p + i);
+      if (mask == 0) { i += 16; continue; }
+      i += (size_t)__builtin_ctz((unsigned)mask);
+      break;
+    }
+#endif
+    while (i < n) {
+      unsigned char c = (unsigned char)p[i];
       if (c < 0x80 && MD_SPECIAL[c] != 0) break;
       i++;
     }
-    if (i > start) out.append(s.substr(start, i - start));
+    if (i > start) out.append(p + start, i - start);
     if (i >= s.size()) break;
     unsigned char c = (unsigned char)s[i];
     if (c == '\\') {
@@ -1993,7 +2026,7 @@ class Renderer {
 // ---------------------------------------------------------------- build
 
 struct Build {
-  const JVal* input;
+  const CaseInput* input;
   string base;
   string siteTitle;
   int perPage = 0, recent = 0;
@@ -2031,17 +2064,14 @@ struct Build {
   }
 
   void parseTemplates() {
-    const JVal* t = input->get("templates");
-    if (t == nullptr || t->t != JVal::OBJ) throw std::runtime_error("input.templates");
-    vector<string> names;
-    for (auto& kv : t->obj) names.push_back(string(kv.first));
-    std::sort(names.begin(), names.end());
-    for (const string& name : names) {
+    auto list = input->templates;
+    std::sort(list.begin(), list.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    for (const auto& kv : list) {
+      string name(kv.first);
       Template tmpl;
       tmpl.name = name;
-      const JVal* src = t->get(name);
       try {
-        tmpl.body = parseTemplate(name, src->s, tpool);
+        tmpl.body = parseTemplate(name, kv.second, tpool);
         tmpl.ok = true;
       } catch (const TemplateError& e) {
         tmpl.error = e.what();
@@ -2051,41 +2081,32 @@ struct Build {
       templates.push_back(std::move(tmpl));
     }
   }
-
   void readSources() {
-    const JVal* files = input->get("files");
-    if (files == nullptr || files->t != JVal::ARR) throw std::runtime_error("input.files");
-    struct FileIn { string_view path; string_view content; };
-    vector<FileIn> fs;
-    fs.reserve(files->arr.size());
-    for (const JVal* f : files->arr) {
-      const JVal* p = f->get("path");
-      const JVal* c = f->get("content");
-      fs.push_back({p->s, c->s});
-    }
-    std::sort(fs.begin(), fs.end(), [](const FileIn& a, const FileIn& b) { return a.path < b.path; });
+    auto fs = input->files;
+    std::sort(fs.begin(), fs.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
     for (auto& f : fs) {
-      if (f.path.size() >= 3 && f.path.compare(f.path.size() - 3, 3, ".md") == 0) {
+      string_view path = f.first;
+      string_view content = f.second;
+      if (path.size() >= 3 && path.compare(path.size() - 3, 3, ".md") == 0) {
         Source s;
-        s.path.assign(f.path);
-        if (f.content.find('\r') == string::npos) s.text = f.content;
+        s.path.assign(path);
+        if (content.find('\r') == string_view::npos) s.text = content;
         else {
-          s.textOwned.reserve(f.content.size());
-          for (size_t i = 0; i < f.content.size(); i++) {
-            if (f.content[i] == '\r') {
-              if (i + 1 < f.content.size() && f.content[i + 1] == '\n') i++;
+          s.textOwned.reserve(content.size());
+          for (size_t i = 0; i < content.size(); i++) {
+            if (content[i] == '\r') {
+              if (i + 1 < content.size() && content[i + 1] == '\n') i++;
               s.textOwned.push_back('\n');
-            } else s.textOwned.push_back(f.content[i]);
+            } else s.textOwned.push_back(content[i]);
           }
           s.text = s.textOwned;
         }
         sources.push_back(std::move(s));
       } else {
-        statics.push_back({f.path, f.content});
+        statics.push_back({path, content});
       }
     }
   }
-
   void frontMatterPass() {
     vector<Source> kept;
     for (Source& s : sources) {
@@ -2570,17 +2591,11 @@ struct Build {
   }
 
   void run() {
-    const JVal* site = input->get("site");
-    if (site == nullptr || site->t != JVal::OBJ) throw std::runtime_error("input.site");
-    const JVal* title = site->get("title");
-    const JVal* baseUrl = site->get("base_url");
-    const JVal* per = site->get("per_page");
-    const JVal* rec = site->get("recent");
-    siteTitle.assign(title->s);
-    base.assign(baseUrl->s);
+    siteTitle.assign(input->siteTitle);
+    base.assign(input->baseUrl);
     while (!base.empty() && base.back() == '/') base.pop_back();
-    perPage = (int)per->n;
-    recent = (int)rec->n;
+    perPage = input->perPage;
+    recent = input->recent;
 
     bool tm = getenv("ENGINE_TIMING") != nullptr;
     double t;
@@ -2618,21 +2633,16 @@ static void appendAnswers(OutBuf& dst, const Build& b) {
 
 static OutBuf runAll(string_view casesJson) {
   double t0 = nowMs();
-  JNodePool pool;
-  pool.decode.reserve(casesJson.size() + 16);
-  JsonParser parser(casesJson, pool);
-  JVal* root = parser.parse();
+  CasesParser parser(casesJson);
+  vector<CaseInput> cases = parser.parse();
   if (timingOn()) fprintf(stderr, "parse %.2f\n", nowMs() - t0);
-  if (root->t != JVal::ARR) throw std::runtime_error("cases.json is not an array");
   OutBuf out;
   out.ensure(casesJson.size() * 3 + 64);
   out.put('[');
-  for (size_t i = 0; i < root->arr.size(); i++) {
+  for (size_t i = 0; i < cases.size(); i++) {
     if (i != 0) out.put(',');
-    JVal* c = root->arr[i];
-    const JVal* input = c->get("input");
     Build b;
-    b.input = input;
+    b.input = &cases[i];
     double tb = nowMs();
     b.run();
     if (timingOn()) fprintf(stderr, "build %zu %.2f\n", i, nowMs() - tb);

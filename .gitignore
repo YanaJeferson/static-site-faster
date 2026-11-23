@@ -4,3 +4,7 @@ out/
 
 native/inline-test*
 native/engine_dbg.node
+native/bench*
+native/engine.node.bak
+native/gmon.out
+native/prof/
