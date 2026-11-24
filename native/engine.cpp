@@ -27,6 +27,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #endif
 #if defined(__SSE2__)
 #include <emmintrin.h>
@@ -2768,8 +2769,8 @@ static napi_value RunAll(napi_env env, napi_callback_info info) {
 
 #ifndef NATIVE_TEST
 static napi_value RunFile(napi_env env, napi_callback_info info) {
-  size_t argc = 2;
-  napi_value argv[2];
+  size_t argc = 3;
+  napi_value argv[3];
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
   if (argc < 2) {
     napi_throw_type_error(env, nullptr, "runFile needs an input and an output path");
@@ -2785,6 +2786,8 @@ static napi_value RunFile(napi_env env, napi_callback_info info) {
   string inPath, outPath;
   pathOf(argv[0], inPath);
   pathOf(argv[1], outPath);
+  bool exitWhenDone = false;
+  if (argc >= 3) napi_get_value_bool(env, argv[2], &exitWhenDone);
   try {
     int fd = open(inPath.c_str(), O_RDONLY);
     if (fd < 0) throw std::runtime_error("cannot open " + inPath);
@@ -2811,6 +2814,7 @@ static napi_value RunFile(napi_env env, napi_callback_info info) {
       if (n <= 0) { close(out); throw std::runtime_error("cannot write " + outPath); }
       wrote += (size_t)n;
     }
+    if (exitWhenDone) _exit(0);
     close(out);
   } catch (const std::exception& e) {
     napi_throw_error(env, nullptr, e.what());

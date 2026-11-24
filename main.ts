@@ -7,7 +7,7 @@ const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 const casesPath = `${INPUT_DIR}/cases.json`;
 const outPath = `${OUTPUT_DIR}/answers.json`;
 
-interface Engine { runFile?: (input: string, output: string) => void; runAll?: (cases: Buffer) => Buffer }
+interface Engine { runFile?: (input: string, output: string, exitWhenDone?: boolean) => void; runAll?: (cases: Buffer) => Buffer }
 let native: Engine | undefined;
 try {
   const file = process.arch === 'arm64' ? './native/engine.arm64.node' : './native/engine.node';
@@ -35,7 +35,7 @@ async function javascript(): Promise<void> {
 
 if (native?.runFile !== undefined) {
   try {
-    native.runFile(casesPath, outPath);
+    native.runFile(casesPath, outPath, true);
   } catch {
     void javascript();
   }
